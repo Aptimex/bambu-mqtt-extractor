@@ -25,6 +25,7 @@ from extractors import (
     extract_virtual_ids,
     extract_feature_flags,
     extract_filament_presets,
+    extract_ams_response_format,
     generate_indices,
     generate_schema_version,
 )
@@ -85,6 +86,9 @@ Examples:
 
     print("\n=== Extracting filament presets ===")
     presets = extract_filament_presets.extract(repo_root, config_dir, printers)
+
+    print("\n=== Extracting AMS response formats ===")
+    ams_formats = extract_ams_response_format.extract(repo_root, config_dir, printers)
 
     print("\n=== Extracting feature flags ===")
     feature_flags = extract_feature_flags.extract(repo_root, config_dir, printers)

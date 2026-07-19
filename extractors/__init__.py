@@ -9,6 +9,7 @@ from . import (
     extract_virtual_ids,
     extract_feature_flags,
     extract_filament_presets,
+    extract_ams_response_format,
     generate_indices,
     generate_schema_version,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "extract_virtual_ids",
     "extract_feature_flags",
     "extract_filament_presets",
+    "extract_ams_response_format",
     "generate_indices",
     "generate_schema_version",
 ]

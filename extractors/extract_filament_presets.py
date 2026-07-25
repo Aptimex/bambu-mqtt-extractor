@@ -1,272 +1,312 @@
 #!/usr/bin/env python3
 """
-Extract filament presets from printer configs, blacklist, and filament profile files.
+Extract filament presets from the Bambu Studio profile tree.
+
+Profiles form an inheritance chain: a concrete profile such as
+"Bambu PLA Basic @base" inherits "fdm_filament_pla", which inherits
+"fdm_filament_common". Most fields — including the nozzle temperature range and
+the filament type — are only defined partway up that chain, so a preset can
+only be read correctly by resolving the whole chain.
+
+Two things are easy to get wrong here and both produce silently bad data:
+
+  * `nozzle_temperature` is the single recommended print temperature, NOT the
+    allowed range. The range is `nozzle_temperature_range_low` /
+    `nozzle_temperature_range_high`. Using the former yields min == max.
+  * `filament_id` is NOT unique across vendors — QIDI's "PLA-CF" also claims
+    GFA00. Bambu Lab (BBL) profiles must win, and within a vendor the "@base"
+    profile must win over per-nozzle variants.
 """
 
 import json
-import re
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional
+
+# Vendor directory that defines the canonical meaning of a Bambu filament id.
+CANONICAL_VENDOR = "BBL"
+
+# Guard against a malformed profile tree sending us into a cycle.
+MAX_INHERIT_DEPTH = 32
+
+# Fallback filament type by filament_id prefix, used only when the resolved
+# inheritance chain defines no filament_type at all.
+TYPE_BY_PREFIX = {
+    "GFA": "PLA",
+    "GFB": "ABS",
+    "GFC": "PC",
+    "GFG": "PETG",
+    "GFL": "PLA",
+    "GFN": "PA",
+    "GFP": "PVA",
+    "GFR": "PA",
+    "GFS": "PVA",
+    "GFT": "TPU",
+    "GFU": "TPU",
+}
 
 
-def extract_filament_from_profile(file_path: Path, base_profiles: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract filament data from a profile JSON file, including inherited base profile data."""
+def first_value(raw: Any) -> Any:
+    """
+    Unwrap a Bambu Studio config value.
+
+    Profile fields are stored as single-element lists of strings
+    (e.g. ["220"]); a few are plain scalars.
+    """
+    if isinstance(raw, list):
+        return raw[0] if raw else None
+    return raw
+
+
+def as_int(raw: Any) -> Optional[int]:
+    """Coerce a profile value to int, or None if it isn't numeric."""
+    value = first_value(raw)
+    if value is None or isinstance(value, bool):
+        return None
     try:
-        with open(file_path) as f:
-            data = json.load(f)
-    except:
+        return int(float(value))
+    except (TypeError, ValueError):
         return None
 
-    filament_id = data.get("filament_id")
-    if not filament_id:
-        return None
 
-    # Extract useful fields
-    result = {
-        "filament_id": filament_id,
-        "filament_name": data.get("name", ""),
-        "filament_type": "",
-        "nozzle_temp_min": 0,
-        "nozzle_temp_max": 0,
-        "bed_temp": 0,
-        "color": "",
-        "is_bambu": False,
-    }
-
-    # Extract filament type from inherits or other fields
-    inherits = data.get("inherits", "")
-    if "pla" in inherits.lower():
-        result["filament_type"] = "PLA"
-    elif "abs" in inherits.lower():
-        result["filament_type"] = "ABS"
-    elif "petg" in inherits.lower() or "fdm_filament_pet" in inherits.lower():
-        result["filament_type"] = "PETG"
-    elif "tpu" in inherits.lower():
-        result["filament_type"] = "TPU"
-    elif "asa" in inherits.lower():
-        result["filament_type"] = "ASA"
-    elif "pva" in inherits.lower():
-        result["filament_type"] = "PVA"
-    elif "pc" in inherits.lower():
-        result["filament_type"] = "PC"
-    elif "pa" in inherits.lower() or "nylon" in inherits.lower():
-        result["filament_type"] = "PA"
-    elif "cf" in inherits.lower() or "carbon" in inherits.lower():
-        result["filament_type"] = "CF"
-    
-    # Fallback: determine from filament_id prefix
-    if not result["filament_type"]:
-        fid = result["filament_id"]
-        if fid.startswith("GFA") or fid.startswith("GFL"):
-            result["filament_type"] = "PLA"
-        elif fid.startswith("GFB"):
-            result["filament_type"] = "ABS"
-        elif fid.startswith("GFG"):
-            result["filament_type"] = "PETG"
-        elif fid.startswith("GFU"):
-            result["filament_type"] = "TPU"
-        elif fid.startswith("GFB") and not fid.startswith("GFB9"):
-            result["filament_type"] = "ABS"
-        elif fid.startswith("GFN"):
-            result["filament_type"] = "PA"
-        elif fid.startswith("GFC"):
-            result["filament_type"] = "PC"
-        elif fid.startswith("GFP"):
-            result["filament_type"] = "PVA"
-        elif fid.startswith("GFR"):
-            result["filament_type"] = "PA"
-        elif fid.startswith("GFS"):
-            result["filament_type"] = "PVA"
-        elif fid.startswith("GFT"):
-            result["filament_type"] = "TPU"
-
-    # Try to get temperature settings from this profile first
-    for key in ["nozzle_temp_min", "filament_nozzle_temp_min"]:
-        if key in data:
-            val = data[key]
-            if isinstance(val, list) and val:
-                result["nozzle_temp_min"] = val[0] if isinstance(val[0], (int, float)) else int(val[0])
-            elif isinstance(val, (int, float)):
-                result["nozzle_temp_min"] = int(val)
-
-    for key in ["nozzle_temp_max", "filament_nozzle_temp_max"]:
-        if key in data:
-            val = data[key]
-            if isinstance(val, list) and val:
-                result["nozzle_temp_max"] = val[0] if isinstance(val[0], (int, float)) else int(val[0])
-            elif isinstance(val, (int, float)):
-                result["nozzle_temp_max"] = int(val)
-
-    for key in ["bed_temp", "filament_bed_temp"]:
-        if key in data:
-            val = data[key]
-            if isinstance(val, list) and val:
-                result["bed_temp"] = val[0] if isinstance(val[0], (int, float)) else int(val[0])
-            elif isinstance(val, (int, float)):
-                result["bed_temp"] = int(val)
-
-    # Extract color
-    for key in ["filament_color", "color"]:
-        if key in data:
-            val = data[key]
-            if isinstance(val, list) and val:
-                result["color"] = val[0] if isinstance(val[0], str) else str(val[0])
-            elif isinstance(val, str):
-                result["color"] = val
-
-    # Mark Bambu Lab filaments
-    if data.get("filament_vendor", [""])[0] == "Bambu Lab" or "Bambu" in data.get("name", ""):
-        result["is_bambu"] = True
-
-    # If we have inherits, try to get base profile temperatures
-    inherits = data.get("inherits", "")
-    if inherits and base_profiles:
-        base = base_profiles.get(inherits)
-        if base:
-            # Get base nozzle temperature
-            if result["nozzle_temp_min"] == 0:
-                for key in ["nozzle_temperature"]:
-                    if key in base:
-                        val = base[key]
-                        if isinstance(val, list) and val:
-                            result["nozzle_temp_min"] = val[0] if isinstance(val[0], (int, float)) else int(val[0])
-                        elif isinstance(val, (int, float)):
-                            result["nozzle_temp_min"] = int(val)
-                        break
-
-            if result["nozzle_temp_max"] == 0:
-                for key in ["nozzle_temperature"]:
-                    if key in base:
-                        val = base[key]
-                        if isinstance(val, list) and val:
-                            result["nozzle_temp_max"] = val[0] if isinstance(val[0], (int, float)) else int(val[0])
-                        elif isinstance(val, (int, float)):
-                            result["nozzle_temp_max"] = int(val)
-                        break
-
-            if result["bed_temp"] == 0:
-                for key in ["hot_plate_temp"]:
-                    if key in base:
-                        val = base[key]
-                        if isinstance(val, list) and val:
-                            result["bed_temp"] = val[0] if isinstance(val[0], (int, float)) else int(val[0])
-                        elif isinstance(val, (int, float)):
-                            result["bed_temp"] = int(val)
-                        break
-
-    return result
+def as_str(raw: Any) -> str:
+    """Coerce a profile value to a stripped string."""
+    value = first_value(raw)
+    return str(value).strip() if value is not None else ""
 
 
-def load_base_profiles(repo_root: Path) -> Dict[str, Any]:
-    """Load base filament profiles (fdm_filament_*) from BBL profiles."""
-    base_profiles = {}
+def load_all_profiles(repo_root: Path) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Load every filament profile in the repo, keyed by vendor then profile name.
+
+    The name (not the filename) is what `inherits` refers to. Profiles must be
+    kept per vendor because the base profile names are NOT unique: every vendor
+    ships its own `fdm_filament_pla`, and they disagree (Anker's PLA tops out at
+    230C, Bambu's at 240C). Flattening them into one namespace silently
+    resolves Bambu filaments against another vendor's temperatures.
+    """
+    profiles: Dict[str, Dict[str, Dict[str, Any]]] = {}
     profiles_root = repo_root / "resources" / "profiles"
     if not profiles_root.exists():
-        return base_profiles
+        return profiles
 
-    # Look in BBL/filament for base profiles
-    filament_dir = profiles_root / "BBL" / "filament"
-    if not filament_dir.exists():
-        return base_profiles
-
-    for profile_file in filament_dir.glob("fdm_filament_*.json"):
-        try:
-            with open(profile_file) as f:
-                data = json.load(f)
-        except:
+    for vendor_dir in sorted(profiles_root.iterdir()):
+        if not vendor_dir.is_dir():
+            continue
+        filament_dir = vendor_dir / "filament"
+        if not filament_dir.is_dir():
             continue
 
-        name = data.get("name", "")
-        if name:
-            base_profiles[name] = data
+        vendor_profiles: Dict[str, Dict[str, Any]] = {}
+        for profile_file in sorted(filament_dir.glob("*.json")):
+            try:
+                with open(profile_file) as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            name = data.get("name")
+            if not name:
+                continue
+            data["_vendor"] = vendor_dir.name
+            data["_path"] = str(profile_file.relative_to(repo_root))
+            vendor_profiles[name] = data
 
-    return base_profiles
+        if vendor_profiles:
+            profiles[vendor_dir.name] = vendor_profiles
+
+    return profiles
+
+
+def lookup_profile(
+    name: str, vendor: str, profiles: Dict[str, Dict[str, Dict[str, Any]]]
+) -> Optional[Dict[str, Any]]:
+    """
+    Find a profile by name, preferring the vendor that referenced it.
+
+    A profile's `inherits` names a profile in its own vendor tree; only fall
+    back to the canonical vendor if that tree doesn't define it.
+    """
+    vendor_profiles = profiles.get(vendor, {})
+    if name in vendor_profiles:
+        return vendor_profiles[name]
+    return profiles.get(CANONICAL_VENDOR, {}).get(name)
+
+
+def resolve_chain(
+    profile: Dict[str, Any], profiles: Dict[str, Dict[str, Dict[str, Any]]]
+) -> Dict[str, Any]:
+    """
+    Flatten a profile and everything it inherits into one dict.
+
+    Child values win over parent values, matching how Bambu Studio layers
+    presets.
+    """
+    vendor = profile.get("_vendor", CANONICAL_VENDOR)
+    chain: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = profile
+    seen = set()
+
+    for _ in range(MAX_INHERIT_DEPTH):
+        if current is None:
+            break
+        name = current.get("name")
+        if name in seen:
+            break
+        seen.add(name)
+        chain.append(current)
+        parent_name = as_str(current.get("inherits"))
+        current = lookup_profile(parent_name, vendor, profiles) if parent_name else None
+
+    # Apply oldest ancestor first so the concrete profile overrides it.
+    resolved: Dict[str, Any] = {}
+    for entry in reversed(chain):
+        resolved.update(entry)
+    return resolved
+
+
+def profile_priority(profile: Dict[str, Any]) -> tuple:
+    """
+    Rank competing profiles that claim the same filament_id (lower is better).
+
+    Bambu Lab profiles define the canonical meaning of a Bambu filament id;
+    within a vendor the "@base" profile beats per-nozzle/per-printer variants.
+    """
+    vendor = profile.get("_vendor", "")
+    name = profile.get("name", "")
+    return (
+        0 if vendor == CANONICAL_VENDOR else 1,
+        0 if name.endswith("@base") else 1,
+        len(name),
+        name,
+    )
+
+
+def build_preset(
+    profile: Dict[str, Any], profiles: Dict[str, Dict[str, Dict[str, Any]]]
+) -> Dict[str, Any]:
+    """Build a preset record from a profile and its resolved inheritance chain."""
+    resolved = resolve_chain(profile, profiles)
+    filament_id = as_str(profile.get("filament_id"))
+
+    filament_type = as_str(resolved.get("filament_type"))
+    if not filament_type:
+        filament_type = TYPE_BY_PREFIX.get(filament_id[:3], "")
+
+    # The allowed range, not the single recommended temperature. Fall back to
+    # nozzle_temperature only when a profile defines no range at all.
+    nozzle_min = as_int(resolved.get("nozzle_temperature_range_low"))
+    nozzle_max = as_int(resolved.get("nozzle_temperature_range_high"))
+    recommended = as_int(resolved.get("nozzle_temperature"))
+    if nozzle_min is None:
+        nozzle_min = recommended
+    if nozzle_max is None:
+        nozzle_max = recommended
+
+    vendor = as_str(resolved.get("filament_vendor"))
+
+    preset = {
+        "filament_id": filament_id,
+        "filament_name": as_str(profile.get("name")),
+        "filament_type": filament_type,
+        "nozzle_temp_min": nozzle_min if nozzle_min is not None else 0,
+        "nozzle_temp_max": nozzle_max if nozzle_max is not None else 0,
+        "bed_temp": as_int(resolved.get("hot_plate_temp")) or 0,
+        "color": as_str(resolved.get("filament_color")),
+        "is_bambu": vendor == "Bambu Lab" or profile.get("_vendor") == CANONICAL_VENDOR,
+    }
+
+    if recommended is not None:
+        preset["nozzle_temp_recommended"] = recommended
+    return preset
 
 
 def extract(repo_root: Path, config_dir: Path, printers: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract known filament IDs and their default properties."""
+    """Extract filament presets, one JSON file per filament id."""
     output_dir = config_dir / "filament_presets"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    presets = {}
+    profiles = load_all_profiles(repo_root)
+    if not profiles:
+        print(f"  Warning: no filament profiles found under {repo_root}")
 
-    # Known Bambu filament IDs with defaults (hardcoded fallbacks)
-    known_filaments = {
-        "GFU01": {"filament_id": "GFU01", "filament_name": "Bambu PLA Basic", "filament_type": "PLA", "nozzle_temp_min": 190, "nozzle_temp_max": 230, "bed_temp": 65, "color": "00FF00FF", "is_bambu": True},
-        "GFU02": {"filament_id": "GFU02", "filament_name": "Bambu PETG Basic", "filament_type": "PETG", "nozzle_temp_min": 230, "nozzle_temp_max": 250, "bed_temp": 75, "color": "0000FFFF", "is_bambu": True},
-        "GFU03": {"filament_id": "GFU03", "filament_name": "Bambu TPU 95A", "filament_type": "TPU", "nozzle_temp_min": 210, "nozzle_temp_max": 230, "bed_temp": 45, "color": "FF00FFFF", "is_bambu": True},
-        "GFU04": {"filament_id": "GFU04", "filament_name": "Bambu PVA", "filament_type": "PVA", "nozzle_temp_min": 190, "nozzle_temp_max": 210, "bed_temp": 60, "color": "FFFF00FF", "is_bambu": True},
-        "GFU05": {"filament_id": "GFU05", "filament_name": "Bambu PLA-CF", "filament_type": "PLA-CF", "nozzle_temp_min": 220, "nozzle_temp_max": 260, "bed_temp": 65, "color": "333333FF", "is_bambu": True},
-        "GFU06": {"filament_id": "GFU06", "filament_name": "Bambu PETG-CF", "filament_type": "PETG-CF", "nozzle_temp_min": 240, "nozzle_temp_max": 270, "bed_temp": 80, "color": "444444FF", "is_bambu": True},
-        "GFU07": {"filament_id": "GFU07", "filament_name": "Bambu PA-CF", "filament_type": "PA-CF", "nozzle_temp_min": 260, "nozzle_temp_max": 300, "bed_temp": 90, "color": "555555FF", "is_bambu": True},
-        "GFU08": {"filament_id": "GFU08", "filament_name": "Bambu PET-CF", "filament_type": "PET-CF", "nozzle_temp_min": 260, "nozzle_temp_max": 300, "bed_temp": 90, "color": "666666FF", "is_bambu": True},
-        "GFU09": {"filament_id": "GFU09", "filament_name": "Bambu PAHT-CF", "filament_type": "PAHT-CF", "nozzle_temp_min": 280, "nozzle_temp_max": 320, "bed_temp": 100, "color": "777777FF", "is_bambu": True},
-        "GFU10": {"filament_id": "GFU10", "filament_name": "Bambu ASA", "filament_type": "ASA", "nozzle_temp_min": 250, "nozzle_temp_max": 270, "bed_temp": 100, "color": "FF8800FF", "is_bambu": True},
-        "GFU11": {"filament_id": "GFU11", "filament_name": "Bambu PC", "filament_type": "PC", "nozzle_temp_min": 270, "nozzle_temp_max": 310, "bed_temp": 110, "color": "888888FF", "is_bambu": True},
-    }
+    # Group every profile that declares a filament_id, then keep the
+    # highest-priority one per id.
+    by_id: Dict[str, List[Dict[str, Any]]] = {}
+    total_profiles = 0
+    for vendor_profiles in profiles.values():
+        for profile in vendor_profiles.values():
+            total_profiles += 1
+            filament_id = as_str(profile.get("filament_id"))
+            if filament_id:
+                by_id.setdefault(filament_id, []).append(profile)
 
-    # Load base profiles for inheritance lookup
-    base_profiles = load_base_profiles(repo_root)
+    presets: Dict[str, Dict[str, Any]] = {}
+    for filament_id, candidates in by_id.items():
+        best = min(candidates, key=profile_priority)
+        presets[filament_id] = build_preset(best, profiles)
 
-    # Add known filaments
-    presets.update(known_filaments)
+    print(f"  Resolved {len(presets)} filament ids from {total_profiles} profiles "
+          f"across {len(profiles)} vendors")
 
-    # Scan filament profile files from resources/profiles/*/filament/
-    profiles_root = repo_root / "resources" / "profiles"
-    if profiles_root.exists():
-        for vendor_dir in profiles_root.iterdir():
-            if not vendor_dir.is_dir():
-                continue
-            filament_dir = vendor_dir / "filament"
-            if not filament_dir.exists():
-                continue
+    incomplete = [
+        fid
+        for fid, preset in presets.items()
+        if not preset["filament_type"] or not preset["nozzle_temp_max"]
+    ]
+    if incomplete:
+        print(f"  Warning: {len(incomplete)} preset(s) missing type or temperature: "
+              f"{', '.join(sorted(incomplete)[:10])}"
+              f"{' ...' if len(incomplete) > 10 else ''}")
 
-            for profile_file in filament_dir.glob("*.json"):
-                # Skip variant profiles (those with @ in name), only use @base or base profiles
-                # Exception: include "Generic" brand filaments as they are base profiles
-                if "@" in profile_file.stem and not profile_file.stem.endswith("@base"):
-                    if not profile_file.stem.startswith("Generic "):
-                        continue
-
-                filament_data = extract_filament_from_profile(profile_file, base_profiles)
-                if filament_data:
-                    fid = filament_data["filament_id"]
-                    if fid not in presets:
-                        presets[fid] = filament_data
-
-    # Add from printer configs (auto_cali_not_support_filaments)
+    # Filament ids that appear in printer configs but have no profile at all —
+    # record them so a lookup returns something rather than failing outright.
     for model_id, printer_data in printers.items():
         for version, config in printer_data.get("firmware_versions", {}).items():
-            for fid in config.get("auto_cali_not_support_filaments", []):
-                if fid not in presets:
-                    presets[fid] = {
-                        "filament_id": fid,
-                        "filament_type": "Unknown",
+            for filament_id in config.get("auto_cali_not_support_filaments", []):
+                if filament_id not in presets:
+                    presets[filament_id] = {
+                        "filament_id": filament_id,
+                        "filament_name": "",
+                        "filament_type": TYPE_BY_PREFIX.get(filament_id[:3], ""),
+                        "nozzle_temp_min": 0,
+                        "nozzle_temp_max": 0,
+                        "bed_temp": 0,
+                        "color": "",
                         "is_bambu": True,
-                        "note": f"Found in {model_id} v{version} auto_cali_not_support_filaments",
+                        "note": f"No profile found; seen in {model_id} v{version} "
+                                f"auto_cali_not_support_filaments",
                     }
 
-    # From filaments_blacklist.json
+    # Blacklisted filaments are flagged in place so callers can warn.
     blacklist_file = repo_root / "resources" / "printers" / "filaments_blacklist.json"
     if blacklist_file.exists():
         with open(blacklist_file) as f:
             blacklist = json.load(f)
-
         for item in blacklist.get("filaments", []):
-            fid = item.get("filament_id")
-            if fid and fid not in presets:
-                presets[fid] = {
-                    "filament_id": fid,
+            filament_id = item.get("filament_id")
+            if not filament_id:
+                continue
+            if filament_id in presets:
+                presets[filament_id]["is_blacklisted"] = True
+            else:
+                presets[filament_id] = {
+                    "filament_id": filament_id,
                     "filament_name": item.get("filament_name", ""),
                     "filament_type": item.get("filament_type", ""),
-                    "is_blacklisted": True,
+                    "nozzle_temp_min": 0,
+                    "nozzle_temp_max": 0,
+                    "bed_temp": 0,
+                    "color": "",
                     "is_bambu": True,
+                    "is_blacklisted": True,
                 }
 
-    # Write individual preset files
-    for fid, data in presets.items():
-        output_file = output_dir / f"{fid}.json"
-        with open(output_file, "w") as f:
+    # Clear out presets from a previous run so removed ids don't linger.
+    for stale in output_dir.glob("*.json"):
+        if stale.name != "index.json":
+            stale.unlink()
+
+    for filament_id, data in presets.items():
+        with open(output_dir / f"{filament_id}.json", "w") as f:
             json.dump(data, f, indent=2)
 
     return presets

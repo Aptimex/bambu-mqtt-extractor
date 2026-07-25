@@ -19,8 +19,7 @@ def extract(repo_root: Path, config_dir: Path) -> Dict[str, Any]:
 
     content = devdefs_h.read_text()
 
-    defines = {}
-    for define in [
+    wanted = [
         "VIRTUAL_TRAY_MAIN_ID", "VIRTUAL_TRAY_DEPUTY_ID",
         "VIRTUAL_AMS_MAIN_ID_STR", "VIRTUAL_AMS_DEPUTY_ID_STR",
         "MAIN_EXTRUDER_ID", "DEPUTY_EXTRUDER_ID",
@@ -29,15 +28,23 @@ def extract(repo_root: Path, config_dir: Path) -> Dict[str, Any]:
         "LOGIC_R_EXTRUDER_ID",
         "AMS_LITE_MIXED_TRAY_INDEX_OFFSET",
         "INVALID_AMS_TEMPERATURE",
-    ]:
-        match = re.search(rf"#define\s+{define}\s+(\S+)", content)
+    ]
+
+    raw = {}
+    for define in wanted:
+        match = re.search(rf"^\s*#define\s+{define}\s+(.+?)\s*(?://.*)?$",
+                          content, re.MULTILINE)
         if match:
-            val = match.group(1)
-            try:
-                val = int(val, 0)
-            except:
-                pass
-            defines[define] = val
+            raw[define] = match.group(1).strip()
+
+    defines = {}
+    for define in wanted:
+        if define in raw:
+            defines[define] = resolve_value(raw[define], raw)
+
+    missing = [d for d in wanted if d not in defines]
+    if missing:
+        print(f"  Warning: not found in DevDefs.h: {', '.join(missing)}")
 
     # Write to config
     output_file = config_dir / "virtual_ids.json"
@@ -45,6 +52,33 @@ def extract(repo_root: Path, config_dir: Path) -> Dict[str, Any]:
         json.dump(defines, f, indent=2)
 
     return defines
+
+
+def resolve_value(value: str, raw: Dict[str, str], depth: int = 0) -> Any:
+    """
+    Normalize a #define body into a JSON value.
+
+    Handles the three shapes that appear in DevDefs.h: an integer literal, a
+    quoted string (whose quotes are part of the C++ source, not the value), and
+    an alias for another #define (e.g. UNIQUE_EXTRUDER_ID -> MAIN_EXTRUDER_ID).
+    Anything else — such as a C++ expression — is passed through unchanged.
+    """
+    value = value.strip()
+
+    # Alias for another define in this file.
+    if depth < 8 and re.fullmatch(r"[A-Za-z_]\w*", value) and value in raw:
+        return resolve_value(raw[value], raw, depth + 1)
+
+    # Quoted string: the quotes belong to the C++ literal.
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return value[1:-1]
+
+    try:
+        return int(value, 0)
+    except ValueError:
+        pass
+
+    return value
 
 
 if __name__ == "__main__":

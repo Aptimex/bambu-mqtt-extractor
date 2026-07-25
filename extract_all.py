@@ -87,8 +87,10 @@ Examples:
     print("\n=== Extracting filament presets ===")
     presets = extract_filament_presets.extract(repo_root, config_dir, printers)
 
-    print("\n=== Extracting AMS response formats ===")
-    ams_formats = extract_ams_response_format.extract(repo_root, config_dir, printers)
+    print("\n=== Extracting AMS response format ===")
+    ams_formats = extract_ams_response_format.extract(
+        repo_root, config_dir, printers, virtual_ids
+    )
 
     print("\n=== Extracting feature flags ===")
     feature_flags = extract_feature_flags.extract(repo_root, config_dir, printers)

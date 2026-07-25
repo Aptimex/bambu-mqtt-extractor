@@ -8,6 +8,11 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 
+try:  # package import; falls back when this module is run as a script
+    from .generate_indices import PRINTER_META_FILES
+except ImportError:
+    from generate_indices import PRINTER_META_FILES
+
 
 def generate(config_dir: Path, repo_root: Path):
     """Generate schema_version.json"""
@@ -22,8 +27,9 @@ def generate(config_dir: Path, repo_root: Path):
     except:
         commit = "unknown"
 
-    # Count configs
-    printers_count = len(list((config_dir / "printers").glob("*.json"))) - 1  # minus index.json
+    # Count configs (excluding the generated index/name-map files)
+    printers_count = len([f for f in (config_dir / "printers").glob("*.json")
+                          if f.name not in PRINTER_META_FILES])
     commands_count = len(list((config_dir / "commands").glob("*.json"))) - 1
     enums_count = len(list((config_dir / "enums").glob("*.json"))) - 1
     filaments_count = len(list((config_dir / "filament_presets").glob("*.json"))) - 1

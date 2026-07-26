@@ -97,7 +97,10 @@ def load_all_profiles(repo_root: Path) -> Dict[str, Dict[str, Dict[str, Any]]]:
             continue
 
         vendor_profiles: Dict[str, Dict[str, Any]] = {}
-        for profile_file in sorted(filament_dir.glob("*.json")):
+        # Recursive: a vendor tree may group profiles into subdirectories
+        # (BBL keeps the Fiberon/Polymaker and SUNLU lines that way). Those are
+        # still that vendor's profiles, so they share its namespace.
+        for profile_file in sorted(filament_dir.rglob("*.json")):
             try:
                 with open(profile_file) as f:
                     data = json.load(f)

@@ -83,6 +83,10 @@ def generate(config_dir: Path):
             # to be in the index or every filament reads as "Generic".
             "filament_name": data.get("filament_name", ""),
             "filament_type": data.get("filament_type"),
+            # The type as the printer is told it, which support filaments spell
+            # differently from filament_type. In the index so a consumer can
+            # build a complete code -> tray_type map without opening every file.
+            "tray_type": data.get("tray_type", data.get("filament_type")),
             "is_bambu": data.get("is_bambu", False),
             "file": f.name,
         })

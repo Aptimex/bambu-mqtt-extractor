@@ -8,7 +8,7 @@ Profiles form an inheritance chain: a concrete profile such as
 the filament type — are only defined partway up that chain, so a preset can
 only be read correctly by resolving the whole chain.
 
-Two things are easy to get wrong here and both produce silently bad data:
+Three things are easy to get wrong here and all produce silently bad data:
 
   * `nozzle_temperature` is the single recommended print temperature, NOT the
     allowed range. The range is `nozzle_temperature_range_low` /
@@ -16,6 +16,9 @@ Two things are easy to get wrong here and both produce silently bad data:
   * `filament_id` is NOT unique across vendors — QIDI's "PLA-CF" also claims
     GFA00. Bambu Lab (BBL) profiles must win, and within a vendor the "@base"
     profile must win over per-nozzle variants.
+  * `filament_type` is NOT what the printer is told. The `tray_type` field of
+    ams_filament_setting carries the *display* type, which support filaments
+    rewrite — see derive_tray_type below.
 """
 
 import json
@@ -43,6 +46,54 @@ TYPE_BY_PREFIX = {
     "GFT": "TPU",
     "GFU": "TPU",
 }
+
+# Support filaments are announced to the printer under a different type than the
+# one their profile declares: Bambu Support W is a PLA profile but goes out as
+# "PLA-S". Bambu Studio does the rewrite in
+# DynamicPrintConfig::get_filament_type() (src/libslic3r/PrintConfig.cpp), whose
+# return value is what AMSMaterialsSetting passes to
+# command_ams_filament_settings as tray_type. These two tables mirror that
+# function's two support branches.
+#
+# Two details of the original are deliberately preserved:
+#   * The id cases win over the type cases, so GFS01 is "PA-S" even though its
+#     profile resolves to PA either way.
+#   * There is no ABS entry. Studio only maps ABS to "ABS-S" on the branch taken
+#     when the config carries no filament_id, which cannot happen for a preset —
+#     every filament profile declares one. Bambu Support for ABS (GFS06)
+#     therefore goes out as plain "ABS".
+SUPPORT_TRAY_TYPE_BY_ID = {
+    "GFS00": "PLA-S",
+    "GFS01": "PA-S",
+}
+SUPPORT_TRAY_TYPE_BY_TYPE = {
+    "PLA": "PLA-S",
+    "PA": "PA-S",
+}
+
+
+def as_bool(raw: Any) -> bool:
+    """Coerce a profile value to bool. Profiles store flags as ["0"] / ["1"]."""
+    value = first_value(raw)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip() in ("1", "true", "True")
+
+
+def derive_tray_type(filament_id: str, filament_type: str, is_support: bool) -> str:
+    """The type the printer is told, which is not always the profile's type.
+
+    See SUPPORT_TRAY_TYPE_BY_ID for why support filaments differ and which parts
+    of Bambu Studio's logic are mirrored here.
+    """
+    # The id cases are checked unconditionally: GFS00/GFS01 are fixed ids that
+    # always carry filament_is_support in the profile tree, so this matches
+    # Studio while still answering for ids we could not resolve a profile for.
+    if filament_id in SUPPORT_TRAY_TYPE_BY_ID:
+        return SUPPORT_TRAY_TYPE_BY_ID[filament_id]
+    if is_support:
+        return SUPPORT_TRAY_TYPE_BY_TYPE.get(filament_type, filament_type)
+    return filament_type
 
 
 def first_value(raw: Any) -> Any:
@@ -206,10 +257,17 @@ def build_preset(
 
     vendor = as_str(resolved.get("filament_vendor"))
 
+    # Resolved, not read off the profile: the support flag is usually set by an
+    # ancestor (fdm_filament_pva marks every PVA as support) rather than by the
+    # concrete profile.
+    is_support = as_bool(resolved.get("filament_is_support"))
+
     preset = {
         "filament_id": filament_id,
         "filament_name": as_str(profile.get("name")),
         "filament_type": filament_type,
+        "tray_type": derive_tray_type(filament_id, filament_type, is_support),
+        "is_support": is_support,
         "nozzle_temp_min": nozzle_min if nozzle_min is not None else 0,
         "nozzle_temp_max": nozzle_max if nozzle_max is not None else 0,
         "bed_temp": as_int(resolved.get("hot_plate_temp")) or 0,
@@ -266,10 +324,13 @@ def extract(repo_root: Path, config_dir: Path, printers: Dict[str, Any]) -> Dict
         for version, config in printer_data.get("firmware_versions", {}).items():
             for filament_id in config.get("auto_cali_not_support_filaments", []):
                 if filament_id not in presets:
+                    fallback_type = TYPE_BY_PREFIX.get(filament_id[:3], "")
                     presets[filament_id] = {
                         "filament_id": filament_id,
                         "filament_name": "",
-                        "filament_type": TYPE_BY_PREFIX.get(filament_id[:3], ""),
+                        "filament_type": fallback_type,
+                        "tray_type": derive_tray_type(filament_id, fallback_type, False),
+                        "is_support": False,
                         "nozzle_temp_min": 0,
                         "nozzle_temp_max": 0,
                         "bed_temp": 0,
@@ -291,10 +352,13 @@ def extract(repo_root: Path, config_dir: Path, printers: Dict[str, Any]) -> Dict
             if filament_id in presets:
                 presets[filament_id]["is_blacklisted"] = True
             else:
+                blacklisted_type = item.get("filament_type", "")
                 presets[filament_id] = {
                     "filament_id": filament_id,
                     "filament_name": item.get("filament_name", ""),
-                    "filament_type": item.get("filament_type", ""),
+                    "filament_type": blacklisted_type,
+                    "tray_type": derive_tray_type(filament_id, blacklisted_type, False),
+                    "is_support": False,
                     "nozzle_temp_min": 0,
                     "nozzle_temp_max": 0,
                     "bed_temp": 0,
